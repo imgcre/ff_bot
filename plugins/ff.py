@@ -1,8 +1,11 @@
+import asyncio
 from enum import Enum, auto
 import inspect
 import math
 import os
-from typing import Any, Callable, Dict, List, Union, get_args, get_origin
+from typing import Any, Awaitable, Callable, Dict, List, Tuple, Union, get_args, get_origin
+
+import aiohttp
 from mirai import FriendMessage, GroupMessage, MessageEvent
 from ..plugin import Plugin, autorun, instr
 import json
@@ -44,7 +47,7 @@ class FFCsv(Generic[T]):
     def items(self):
         return self.d.items()
 
-    def find_by(self, key: Union[List[Union[T, str, int]], Union[T, str, int]], value):
+    def find_by(self, key: Union[List[Union[T, str, int]], Union[T, str, int]], value) -> 'FFCsvRow[T]':
         for row in self.d.values():
             if not isinstance(key, Iterable):
                 key = [key]
@@ -76,7 +79,7 @@ class FFCsvRow(Generic[T]):
 
     @property
     def key(self):
-        return self.row['key']
+        return self['key']
 
     def items(self):
         return self.row.items()
@@ -113,6 +116,7 @@ class GatheringItemLevelConvertTableKey(Enum):
 
 class RecipeKey(Enum):
     ItemResult = "Item{Result}"
+    AmountResult = "Amount{Result}"
     CraftType = auto()
     RecipeLevelTable = auto()
 
@@ -120,10 +124,7 @@ class RecipeLevelTableKey(Enum):
     ClassJobLevel = auto()
 
 class ItemKey(Enum):
-    ...
-
-# LeveRewardItemGroup
-# LeveRewardItem
+    Singular = auto()
 
 class Db():
     gathering_item: FFCsv[GatheringItemKey]
@@ -205,30 +206,119 @@ class RequiredJob():
             return '?'
         return f'{self.job.name}:{self.level}'
 
+def flatten(S):
+    if S == []:
+        return S
+    if isinstance(S[0], list):
+        return flatten(S[0]) + flatten(S[1:])
+    return S[:1] + flatten(S[1:])
+
+
+class ItemQuality(Enum):
+    NQ = auto()
+    HQ = auto()
+
+    def __str__(self) -> str:
+        return 'HQ' if self is self.HQ else ''
+
+@dataclass
+class Price():
+    nq: int
+    hq: int
+
+    def __getitem__(self, quality: ItemQuality):
+        if quality is ItemQuality.NQ:
+            return self.nq
+        if quality is ItemQuality.HQ:
+            return self.hq
+
+    def __str__(self) -> str:
+        return f'NQ: {self.nq}, HQ: {self.hq}'
+
 class Recipe():
     def __init__(self, name: str, result_count: int = 1) -> None:
-        self.name = name
         self.jobs: List[RequiredJob] = []
         self.materials: List['Material'] = []
         self.result_count = result_count
+        self.require_count = None
+        self.unit_price = None
+        self.item_name, self.item_quality = self.parse_item_str(name)
+        self.selected = False
 
-    def parse(self, count: int, *decos: Callable[[str], Any]): # 需要的成品个数
+    @staticmethod
+    def parse_item_str(name_expr: str) -> Tuple[str, ItemQuality]:
+        item_name = name_expr
+        item_quality = ItemQuality.NQ
+        if name_expr[-1:].upper() == 'Q':
+            item_name = name_expr[:-2]
+            if name_expr[-2:].upper() == 'HQ':
+                item_quality = ItemQuality.HQ
+        return item_name, item_quality
+
+    def resolve_require_count(self, count: int):
         times = math.ceil(count / self.result_count) # 制作次数
+        self.require_count = times * self.result_count
+        for m in self.materials:
+            m.recipe.resolve_require_count(times * m.count)
+
+    async def resolve_unit_price(self):
+        origin = self.__collect_unit_price()
+        cos = flatten(origin)
+        await asyncio.gather(*cos)
+
+    def __collect_unit_price(self):
+        return [self.__update_unit_price(), [m.recipe.__collect_unit_price() for m in self.materials]]
+
+    async def __update_unit_price(self) -> Price:
+        item = db.item.find_by(ItemKey.Singular, self.item_name)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item.key}?entries=400') as response:
+                resp = await response.json()
+        entries = [entry for entry in resp['entries'] if entry['worldName'] == '沃仙曦染']
+        nqs = [entry for entry in entries if not entry['hq']]
+        hqs = [entry for entry in entries if entry['hq']]
+        nq_avg = round(sum([nq['pricePerUnit'] for nq in nqs]) / len(nqs)) if len(nqs) > 0 else None
+        hq_avg = round(sum([hq['pricePerUnit'] for hq in hqs]) / len(hqs)) if len(hqs) > 0 else None
+        self.unit_price = Price(nq_avg, hq_avg)
+        print(f'{self.item_name}{self.item_quality}', self.unit_price)
+
+    def check_min_cost_node(self):
+        if self.min_cost_of() == self.total_price:
+            self.selected = True
+        else:
+            for m in self.materials:
+                m.recipe.check_min_cost_node()
+
+    def min_cost_of(self):
+        if len(self.materials) > 0:
+            return min(self.total_price, sum([m.recipe.min_cost_of() for m in self.materials]))
+        else:
+            return self.total_price
+
+    @property
+    def total_price(self):
+        return self.unit_price[self.item_quality] * self.require_count
+
+    async def parse(self, *decos: Callable[[str], Awaitable[Any]]) -> List[str]: # 需要的成品个数
         s = []
 
         job = []
         if len(self.jobs) > 0:
             job = self.jobs
         else:
-            item = db.get_gathering_item(self.name)
+            item = db.get_gathering_item(self.item_name)
             if item is not None:
                 job = [item.job]
-
-        s.append(f'{self.name} x {times * self.result_count} [{" ".join([str(j) for j in job])}]{" ".join([""] + [str(d()) for d in decos])}')
+        if len(job) == 0:
+            job.append('未知')
+        formatted_item = f'[{"√" if self.selected else "x"}]{self.item_name}{self.item_quality} x {self.require_count} [{" ".join([str(j) for j in job])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item_name) for d in decos])])}'
+        if self.unit_price is not None:
+            formatted_item += f' -> {self.total_price}G'
+        s.append(formatted_item)
 
         sub = []
         for m in self.materials:
-            sub.extend([f'  {r}' for r in m.recipe.parse(times * m.count)])
+            sub.extend(['==' + f'{r}' for r in await m.recipe.parse(*decos)])
         s.extend(sub)
         return s
 
@@ -237,7 +327,7 @@ class Recipe():
         r = Recipe(name)
         matched = False
         for recipe in db.recipe.values():
-            if recipe[RecipeKey.ItemResult] == name:
+            if recipe[RecipeKey.ItemResult] == r.item_name:
                 job = recipe[RecipeKey.CraftType]
                 rj = RequiredJob()
                 rj.job = Job[job]
@@ -245,7 +335,8 @@ class Recipe():
                 r.jobs.append(rj)
                 if not matched:
                     matched = True
-                    for i in range(8):
+                    r.result_count = recipe[RecipeKey.AmountResult]
+                    for i in range(10): #8
                         item_name = recipe[f'Item{{Ingredient}}[{i}]']
                         item_amount = recipe[f'Amount{{Ingredient}}[{i}]']
                         if item_amount > 0:
@@ -272,10 +363,24 @@ class GatheringItem():
         if method in ('●銛',): return Job.捕鱼
         return Job.Unknown
 
+# https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/5296?entries=1800
+
 class FF(Plugin):
     def __init__(self) -> None:
         super().__init__('ff')
 
     @instr('配方')
     async def recipe(self, name: str, count: int = 1):
-        return ['\n'.join((Recipe.build(name)).parse(count))]
+        
+        if name == '帮助':
+            return """ff 配方 目标商品 材料是否跨服? 生产个数 HQ素材列表(逗号分隔)"""
+
+        recipe_tree = Recipe.build(name)
+        recipe_tree.resolve_require_count(count)
+        await recipe_tree.resolve_unit_price()
+        recipe_tree.check_min_cost_node()
+
+        cost = recipe_tree.min_cost_of()
+        price = recipe_tree.total_price
+        profit_margin = round((price - cost) / cost * 100)
+        return ['\n'.join(await recipe_tree.parse()) + f'\n\n成本估计: {cost}G\n价格估计: {price}G\n利润率: {profit_margin}%']
