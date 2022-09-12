@@ -2,7 +2,7 @@ from enum import Enum, auto
 import inspect
 import math
 import os
-from typing import Callable, Dict, List, Union, get_args, get_origin
+from typing import Any, Callable, Dict, List, Union, get_args, get_origin
 from mirai import FriendMessage, GroupMessage, MessageEvent
 from ..plugin import Plugin, autorun, instr
 import json
@@ -66,11 +66,11 @@ class FFCsvRow(Generic[T]):
             key = key.value if type(key.value) is str else key.name
         if key in self.table.key_names.values():
             key = list(self.table.key_names.keys())[list(self.table.key_names.values()).index(key)]
-        if self.table.item_types[key] in self.table.db.tables:
+        if self.table.item_types[key] in self.table.db.tables and Fk.match(self.table.item_types[key], self.row[key]):
             return Fk(self.table.db, self.row[key])
-        if re.match('u?int\\d+|(byte$)', self.row[key]) is not None:
+        if re.match('u?int\\d+|(byte$)', self.table.item_types[key]) is not None:
             return int(self.row[key])
-        if re.match('bit&\\d+', self.row[key]) is not None:
+        if re.match('bit&\\d+', self.table.item_types[key]) is not None:
             return bool(self.row[key])
         return self.row[key]
 
@@ -92,6 +92,10 @@ class Fk:
     def query(self):
         table, item_level_fk = self.fk.split('#')
         return self.db[table][item_level_fk]
+
+    @staticmethod
+    def match(table: str, val: str) -> bool:
+        return re.match(f'{table}#\d+', val) is not None
 
 class GatheringItemKey(Enum):
     Item = auto()
@@ -201,11 +205,6 @@ class RequiredJob():
             return '?'
         return f'{self.job.name}:{self.level}'
 
-class ParsedRecipe():
-    origin: 'Recipe'
-    board_price: int
-    ...
-
 class Recipe():
     def __init__(self, name: str, result_count: int = 1) -> None:
         self.name = name
@@ -213,22 +212,19 @@ class Recipe():
         self.materials: List['Material'] = []
         self.result_count = result_count
 
-    def parse(self, count: int, *decos: Callable): # 需要的成品个数
+    def parse(self, count: int, *decos: Callable[[str], Any]): # 需要的成品个数
         times = math.ceil(count / self.result_count) # 制作次数
         s = []
 
-        job = 'x'
+        job = []
         if len(self.jobs) > 0:
-            job = ' '.join([str(j) for j in self.jobs])
+            job = self.jobs
         else:
             item = db.get_gathering_item(self.name)
             if item is not None:
-                print('gathering item', item)
-                job = item.job
-            else:
-                job = 'X'
+                job = [item.job]
 
-        s.append(f'{self.name} x {times * self.result_count} [{job}]')
+        s.append(f'{self.name} x {times * self.result_count} [{" ".join([str(j) for j in job])}]{" ".join([""] + [str(d()) for d in decos])}')
 
         sub = []
         for m in self.materials:
@@ -251,7 +247,7 @@ class Recipe():
                     matched = True
                     for i in range(8):
                         item_name = recipe[f'Item{{Ingredient}}[{i}]']
-                        item_amount = int(recipe[f'Amount{{Ingredient}}[{i}]'])
+                        item_amount = recipe[f'Amount{{Ingredient}}[{i}]']
                         if item_amount > 0:
                             r.materials.append(Material(self.build(item_name), item_amount))
         return r

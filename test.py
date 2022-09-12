@@ -1,8 +1,3 @@
-from enum import Enum, auto
+import re
 
-
-class Hi():
-    def __str__(self) -> str:
-        return 'hi'
-
-print(' '.join([Hi(), Hi()]))
+print(re.match('Item#\d+', 'Item#5'))
