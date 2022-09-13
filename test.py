@@ -1,3 +1,9 @@
+from enum import Enum, auto
+import inspect
 import re
 
-print(re.match('Item#\d+', 'Item#5'))
+class State(Enum):
+    FroceUse = '使用'
+    Unknown = auto()
+
+print([v.value for v in State if type(v.value) is str])

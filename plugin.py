@@ -108,47 +108,53 @@ class Context():
         if not self.is_target_msg(params, event):
             raise RuntimeError(f'无法在当前上下文中调用')
         args = []
+        resolvers = plugin.get_resolvers()
         for p in params:
-            anno = p.annotation
-            if self.is_type_of(anno, MessageEvent):
+            if self.is_type_of(p.annotation, MessageEvent):
                 args.append(event)
-            elif self.is_type_of(anno, '.plugin.Context'):
+            elif self.is_type_of(p.annotation, '.plugin.Context'):
                 args.append(self)
             else:
-                will_skip = False
-                if self.is_optional(anno):
-                    will_skip = True
-                    anno = get_args(anno)[0]
-                if  p.default is not None:
-                    will_skip = True
-                try:
-                    resolvers = plugin.get_resolvers()
-                    if anno in resolvers:
-                        resolver = resolvers[anno]
-                        sub_args = self.resolve_args(resolver, chain, event, plugin)
-                        try:
-                            sub_res = resolver(*sub_args)
-                        except Exception as e:
-                            raise ResolveFailedException(e)
-                        args.append(sub_res)
-                        continue
-                    if len(chain) == 0:
-                        raise RuntimeError(f'参数不足')
-                    front = chain.pop(0)
-                    if anno in (str, int, float):
-                        if type(front) is not str or isinstance(front, Plain):
-                            raise RuntimeError(f'参数类型错误')
-                        args.append(anno(front.text if isinstance(front, Plain) else front))
-                        continue
-                    raise RuntimeError(f'无法识别的参数类型')
-                except ResolveFailedException as e:
-                    raise e.args[0] from e
-                except Exception as e:
-                    if not will_skip: raise
-                    default = p.default
-                    if default is inspect._empty:
-                        default = None
-                    args.append(default)
+                def append_single_arg():
+                    anno = p.annotation
+                    will_skip = False
+                    if self.is_optional(anno):
+                        will_skip = True
+                        anno = get_args(anno)[0]
+                    if  p.default is not None:
+                        will_skip = True
+                    try:
+                        if anno in resolvers:
+                            resolver = resolvers[anno]
+                            sub_args = self.resolve_args(resolver, chain, event, plugin)
+                            try:
+                                sub_res = resolver(*sub_args)
+                            except Exception as e:
+                                raise ResolveFailedException(e)
+                            args.append(sub_res)
+                            return
+                        if len(chain) == 0:
+                            raise RuntimeError(f'参数不足')
+                        front = chain.pop(0)
+                        if anno in (str, int, float):
+                            if type(front) is not str or isinstance(front, Plain):
+                                raise RuntimeError(f'参数类型错误')
+                            args.append(anno(front.text if isinstance(front, Plain) else front))
+                            return
+                        raise RuntimeError(f'无法识别的参数类型')
+                    except ResolveFailedException as e:
+                        raise e.args[0] from e
+                    except Exception as e:
+                        if not will_skip: raise
+                        default = p.default
+                        if default is inspect._empty:
+                            default = None
+                        args.append(default)
+                if p.kind is inspect._ParameterKind.VAR_POSITIONAL:
+                    while len(chain) > 0:
+                        append_single_arg()
+                else:
+                    append_single_arg()
         return args
 
     @staticmethod

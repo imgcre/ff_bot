@@ -255,7 +255,7 @@ class Recipe():
                 item_quality = ItemQuality.HQ
         return item_name, item_quality
 
-    def resolve_require_count(self, count: int):
+    def resolve_require_count(self, count: int = 1):
         times = math.ceil(count / self.result_count) # 制作次数
         self.require_count = times * self.result_count
         for m in self.materials:
@@ -365,18 +365,43 @@ class GatheringItem():
 
 # https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/5296?entries=1800
 
+class RecipeReq():
+    
+    class State(Enum):
+        FroceUse = '使用'
+        Unknown = auto()
+        ...
+
+    @classmethod
+    def of(self, *lex: str):
+        state = self.State.Unknown
+        state_strs = [v.value for v in self.State if type(v.value) is str]
+        for l in lex:
+            if state is self.State.Unknown:
+                if l not in state_strs:
+                    raise RuntimeError(f'请指定参数名, 可选: {",".join(state_strs)}')
+                ...
+            ...
+        print(lex)
+        ...
+
 class FF(Plugin):
     def __init__(self) -> None:
         super().__init__('ff')
 
+    def get_resolvers(self):
+        return {
+            RecipeReq: RecipeReq.of
+        }
+
     @instr('配方')
-    async def recipe(self, name: str, count: int = 1):
+    async def recipe(self, name: str, expr: RecipeReq):
         
         if name == '帮助':
             return """ff 配方 目标商品 材料是否跨服? 生产个数 HQ素材列表(逗号分隔)"""
 
         recipe_tree = Recipe.build(name)
-        recipe_tree.resolve_require_count(count)
+        recipe_tree.resolve_require_count()
         await recipe_tree.resolve_unit_price()
         recipe_tree.check_min_cost_node()
 
@@ -384,3 +409,7 @@ class FF(Plugin):
         price = recipe_tree.total_price
         profit_margin = round((price - cost) / cost * 100)
         return ['\n'.join(await recipe_tree.parse()) + f'\n\n成本估计: {cost}G\n价格估计: {price}G\n利润率: {profit_margin}%']
+
+    @instr('薪资')
+    async def salary():
+        ...

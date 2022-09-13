@@ -33,7 +33,7 @@ async def on_message(event: MessageEvent):
         if res is not None:
             await send(*res)
     except Exception as e:
-        # raise
+        raise
         await send(
             f' 错误{ctx.pretty_stack()}: ',
             *e.args
