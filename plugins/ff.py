@@ -221,6 +221,24 @@ class ItemQuality(Enum):
     def __str__(self) -> str:
         return 'HQ' if self is self.HQ else ''
 
+class Item():
+    def __init__(self, name: str, quality: ItemQuality) -> None:
+        self.name = name
+        self.quality = quality
+    
+    def __str__(self) -> str:
+        return f'{self.name}{self.quality}'
+
+    @staticmethod
+    def parse(name_expr: str):
+        name = name_expr
+        quality = ItemQuality.NQ
+        if name_expr[-1:].upper() == 'Q':
+            name = name_expr[:-2]
+            if name_expr[-2:].upper() == 'HQ':
+                quality = ItemQuality.HQ
+        return Item(name, quality)
+
 @dataclass
 class Price():
     nq: int
@@ -365,24 +383,33 @@ class GatheringItem():
 
 # https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/5296?entries=1800
 
-class RecipeReq():
+class RecipeRule():
     
+    def __init__(self) -> None:
+        self.force_use_items = []
+
     class State(Enum):
-        FroceUse = '使用'
+        ForceUse = '使用'
         Unknown = auto()
         ...
 
     @classmethod
     def of(self, *lex: str):
+        rule = self.__class__()
         state = self.State.Unknown
         state_strs = [v.value for v in self.State if type(v.value) is str]
         for l in lex:
+            if l in state_strs:
+                state = self.State(l)
+                continue
             if state is self.State.Unknown:
-                if l not in state_strs:
-                    raise RuntimeError(f'请指定参数名, 可选: {",".join(state_strs)}')
+                raise RuntimeError(f'请指定规则名, 可选: {",".join(state_strs)}')
+            if state is self.State.ForceUse:
+                
                 ...
             ...
         print(lex)
+        return rule
         ...
 
 class FF(Plugin):
@@ -391,11 +418,11 @@ class FF(Plugin):
 
     def get_resolvers(self):
         return {
-            RecipeReq: RecipeReq.of
+            RecipeRule: RecipeRule.of
         }
 
     @instr('配方')
-    async def recipe(self, name: str, expr: RecipeReq):
+    async def recipe(self, name: str, expr: RecipeRule):
         
         if name == '帮助':
             return """ff 配方 目标商品 材料是否跨服? 生产个数 HQ素材列表(逗号分隔)"""
