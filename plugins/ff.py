@@ -3,10 +3,12 @@ from enum import Enum, auto
 import inspect
 import math
 import os
+import sys
 from typing import Any, Awaitable, Callable, Dict, List, Tuple, Union, get_args, get_origin
 
 import aiohttp
 from mirai import FriendMessage, GroupMessage, MessageEvent
+
 from ..plugin import Plugin, autorun, instr
 import json
 from dataclasses import dataclass
@@ -260,18 +262,8 @@ class Recipe():
         self.result_count = result_count
         self.require_count = None
         self.unit_price = None
-        self.item_name, self.item_quality = self.parse_item_str(name)
+        self.item = Item.parse(name)
         self.selected = False
-
-    @staticmethod
-    def parse_item_str(name_expr: str) -> Tuple[str, ItemQuality]:
-        item_name = name_expr
-        item_quality = ItemQuality.NQ
-        if name_expr[-1:].upper() == 'Q':
-            item_name = name_expr[:-2]
-            if name_expr[-2:].upper() == 'HQ':
-                item_quality = ItemQuality.HQ
-        return item_name, item_quality
 
     def resolve_require_count(self, count: int = 1):
         times = math.ceil(count / self.result_count) # 制作次数
@@ -288,9 +280,9 @@ class Recipe():
         return [self.__update_unit_price(), [m.recipe.__collect_unit_price() for m in self.materials]]
 
     async def __update_unit_price(self) -> Price:
-        item = db.item.find_by(ItemKey.Singular, self.item_name)
+        item_rec = db.item.find_by(ItemKey.Singular, self.item.name)
         async with aiohttp.ClientSession() as session:
-            async with session.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item.key}?entries=400') as response:
+            async with session.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=400') as response:
                 resp = await response.json()
         entries = [entry for entry in resp['entries'] if entry['worldName'] == '沃仙曦染']
         nqs = [entry for entry in entries if not entry['hq']]
@@ -298,7 +290,7 @@ class Recipe():
         nq_avg = round(sum([nq['pricePerUnit'] for nq in nqs]) / len(nqs)) if len(nqs) > 0 else None
         hq_avg = round(sum([hq['pricePerUnit'] for hq in hqs]) / len(hqs)) if len(hqs) > 0 else None
         self.unit_price = Price(nq_avg, hq_avg)
-        print(f'{self.item_name}{self.item_quality}', self.unit_price)
+        print(f'{self.item}', self.unit_price)
 
     def check_min_cost_node(self):
         if self.min_cost_of() == self.total_price:
@@ -315,7 +307,10 @@ class Recipe():
 
     @property
     def total_price(self):
-        return self.unit_price[self.item_quality] * self.require_count
+        price = self.unit_price[self.item.quality]
+        if price is None:
+            raise RuntimeError(f'未查询到物品"{self.item}"的价格')
+        return self.unit_price[self.item.quality] * self.require_count
 
     async def parse(self, *decos: Callable[[str], Awaitable[Any]]) -> List[str]: # 需要的成品个数
         s = []
@@ -324,12 +319,12 @@ class Recipe():
         if len(self.jobs) > 0:
             job = self.jobs
         else:
-            item = db.get_gathering_item(self.item_name)
+            item = db.get_gathering_item(self.item.name)
             if item is not None:
                 job = [item.job]
         if len(job) == 0:
             job.append('未知')
-        formatted_item = f'[{"√" if self.selected else "x"}]{self.item_name}{self.item_quality} x {self.require_count} [{" ".join([str(j) for j in job])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item_name) for d in decos])])}'
+        formatted_item = f'[{"√" if self.selected else "x"}]{self.item} x {self.require_count} [{" ".join([str(j) for j in job])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item.name) for d in decos])])}'
         if self.unit_price is not None:
             formatted_item += f' -> {self.total_price}G'
         s.append(formatted_item)
@@ -345,7 +340,7 @@ class Recipe():
         r = Recipe(name)
         matched = False
         for recipe in db.recipe.values():
-            if recipe[RecipeKey.ItemResult] == r.item_name:
+            if recipe[RecipeKey.ItemResult] == r.item.name:
                 job = recipe[RecipeKey.CraftType]
                 rj = RequiredJob()
                 rj.job = Job[job]
@@ -381,21 +376,20 @@ class GatheringItem():
         if method in ('●銛',): return Job.捕鱼
         return Job.Unknown
 
-# https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/5296?entries=1800
-
 class RecipeRule():
-    
     def __init__(self) -> None:
-        self.force_use_items = []
+        self.force_use_items: List[Item] = []
+        self.cross_server_query = False
 
     class State(Enum):
-        ForceUse = '使用'
+        ForceUse = '使用' # 指定最终配方强制使用某种材料
+        CrossServer = '跨服查价' # 启用后将计算全区平均价格
         Unknown = auto()
         ...
 
     @classmethod
     def of(self, *lex: str):
-        rule = self.__class__()
+        rule = RecipeRule()
         state = self.State.Unknown
         state_strs = [v.value for v in self.State if type(v.value) is str]
         for l in lex:
@@ -405,12 +399,13 @@ class RecipeRule():
             if state is self.State.Unknown:
                 raise RuntimeError(f'请指定规则名, 可选: {",".join(state_strs)}')
             if state is self.State.ForceUse:
-                
-                ...
-            ...
-        print(lex)
+                rule.force_use_items.append(Item.parse(l))
+                continue
+            if state is self.State.CrossServer:
+                rule.cross_server_query = True
+                state = self.State.Unknown
+                continue
         return rule
-        ...
 
 class FF(Plugin):
     def __init__(self) -> None:

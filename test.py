@@ -1,9 +1,3 @@
-from enum import Enum, auto
-import inspect
-import re
+import easyocr
+reader = easyocr.Reader(['ch_sim','en'])
 
-class State(Enum):
-    FroceUse = '使用'
-    Unknown = auto()
-
-print(State('使用'))
