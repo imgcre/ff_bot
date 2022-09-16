@@ -3,6 +3,7 @@ from enum import Enum, auto
 import inspect
 import math
 import os
+import stat
 import sys
 from typing import Any, Awaitable, Callable, Dict, List, Tuple, Union, get_args, get_origin
 
@@ -83,6 +84,10 @@ class FFCsvRow(Generic[T]):
     def key(self):
         return self['key']
 
+    @property
+    def key_as_fk(self):
+        return Fk.of(self.table, self.key)
+
     def items(self):
         return self.row.items()
 
@@ -94,9 +99,17 @@ class Fk:
         self.db = db
         self.fk = fk
 
+    def __eq__(self, __o: object) -> bool:
+        return self.fk == __o
+
     def query(self):
         table, item_level_fk = self.fk.split('#')
         return self.db[table][item_level_fk]
+
+    @staticmethod
+    def of(table: FFCsv, id: int):
+        return Fk(table.db, f'{table.table_name}#{id}')
+        ...
 
     @staticmethod
     def match(table: str, val: str) -> bool:
@@ -128,6 +141,10 @@ class RecipeLevelTableKey(Enum):
 class ItemKey(Enum):
     Singular = auto()
 
+class ShopItemGilKey(Enum):
+    Item = auto()
+    Gil = auto()
+
 class Db():
     gathering_item: FFCsv[GatheringItemKey]
     spearfishing_item: FFCsv[SpearfishingItemKey]
@@ -136,6 +153,7 @@ class Db():
     recipe: FFCsv[RecipeKey]
     recipe_level_table: FFCsv[RecipeLevelTableKey]
     item: FFCsv[ItemKey]
+    shop_item_gil: FFCsv[ShopItemGilKey]
 
     def __init__(self) -> None:
         self.tables = {}
@@ -264,6 +282,7 @@ class Recipe():
         self.unit_price = None
         self.item = Item.parse(name)
         self.selected = False
+        self.shop_price = None
 
     def resolve_require_count(self, count: int = 1):
         times = math.ceil(count / self.result_count) # 制作次数
@@ -275,6 +294,14 @@ class Recipe():
         origin = self.__collect_unit_price()
         cos = flatten(origin)
         await asyncio.gather(*cos)
+
+    def resolve_shop_price(self):
+        item_rec = db.item.find_by(ItemKey.Singular, self.item.name)
+        found_shop_gil = db.shop_item_gil.find_by(ShopItemGilKey.Item, item_rec.key_as_fk)
+        if found_shop_gil is not None:
+            self.shop_price = found_shop_gil[ShopItemGilKey.Gil]
+        for m in self.materials:
+            m.recipe.resolve_shop_price()
 
     def __collect_unit_price(self):
         return [self.__update_unit_price(), [m.recipe.__collect_unit_price() for m in self.materials]]
@@ -308,23 +335,30 @@ class Recipe():
     @property
     def total_price(self):
         price = self.unit_price[self.item.quality]
+        if self.item.quality is ItemQuality.NQ and self.shop_price is not None:
+            if price is None:
+                price = self.shop_price
+            else:
+                price = min(self.shop_price, price)
         if price is None:
             raise RuntimeError(f'未查询到物品"{self.item}"的价格')
-        return self.unit_price[self.item.quality] * self.require_count
+        return price * self.require_count
 
     async def parse(self, *decos: Callable[[str], Awaitable[Any]]) -> List[str]: # 需要的成品个数
         s = []
 
-        job = []
+        obtain_ways = []
         if len(self.jobs) > 0:
-            job = self.jobs
+            obtain_ways = self.jobs
         else:
             item = db.get_gathering_item(self.item.name)
             if item is not None:
-                job = [item.job]
-        if len(job) == 0:
-            job.append('未知')
-        formatted_item = f'[{"√" if self.selected else "x"}]{self.item} x {self.require_count} [{" ".join([str(j) for j in job])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item.name) for d in decos])])}'
+                obtain_ways = [item.job]
+        if self.shop_price is not None:
+            obtain_ways.append(f'商店:{self.shop_price}G')
+        if len(obtain_ways) == 0:
+            obtain_ways.append('未知')
+        formatted_item = f'[{"√" if self.selected else "x"}]{self.item} x {self.require_count} [{" ".join([str(j) for j in obtain_ways])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item.name) for d in decos])])}'
         if self.unit_price is not None:
             formatted_item += f' -> {self.total_price}G'
         s.append(formatted_item)
@@ -424,6 +458,7 @@ class FF(Plugin):
 
         recipe_tree = Recipe.build(name)
         recipe_tree.resolve_require_count()
+        recipe_tree.resolve_shop_price()
         await recipe_tree.resolve_unit_price()
         recipe_tree.check_min_cost_node()
 
