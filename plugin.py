@@ -1,10 +1,11 @@
+from enum import Enum
 import importlib.util
 import inspect
 from typing import Any, Callable, Final, Dict, List, Tuple, Union, get_args, get_origin
 
 import glob
 
-from mirai import MessageChain, MessageEvent, Mirai, Plain
+from mirai import Image, MessageChain, MessageEvent, Mirai, Plain
 
 PLUGIN_PATH: Final[str] = './plugins/*.py'
 
@@ -121,7 +122,7 @@ class Context():
                     if self.is_optional(anno):
                         will_skip = True
                         anno = get_args(anno)[0]
-                    if  p.default is not None:
+                    if  p.default is not inspect._empty:
                         will_skip = True
                     try:
                         if anno in resolvers:
@@ -140,6 +141,16 @@ class Context():
                             if type(front) is not str or isinstance(front, Plain):
                                 raise RuntimeError(f'参数类型错误')
                             args.append(anno(front.text if isinstance(front, Plain) else front))
+                            return
+                        if issubclass(anno, Enum):
+                            values = [e.value for e in anno]
+                            if front not in values:
+                                print(front)
+                                raise RuntimeError(f'枚举值无效, 可选: {", ".join(values)}')
+                            args.append(anno(front))
+                            return
+                        if anno is Image and type(front) is Image:
+                            args.append(front)
                             return
                         raise RuntimeError(f'无法识别的参数类型')
                     except ResolveFailedException as e:

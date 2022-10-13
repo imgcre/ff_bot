@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from mirai import At, FriendMessage, MessageEvent, MessageChain, GroupMessage
+from mirai import At, FriendMessage, MessageEvent, MessageChain, GroupMessage, TempMessage
 
 class Activator(ABC):
     @abstractmethod
@@ -15,6 +15,6 @@ class AtActivator(Activator):
                 return event.message_chain[2:]
             else: 
                 return None
-        elif isinstance(event, FriendMessage):
+        elif isinstance(event, FriendMessage) or (isinstance(event, TempMessage)):
             return event.message_chain[1:]
         return None

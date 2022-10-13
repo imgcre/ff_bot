@@ -1,3 +1,3 @@
-import easyocr
-reader = easyocr.Reader(['ch_sim','en'])
+# -*- coding: utf-8 -*-
 
+print(sorted([2, None, 6], key=lambda x: x))

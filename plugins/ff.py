@@ -2,13 +2,20 @@ import asyncio
 from enum import Enum, auto
 import inspect
 import math
+from operator import iconcat
 import os
+import random
 import stat
 import sys
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Tuple, Union, get_args, get_origin
+import urllib.parse
 
 import aiohttp
-from mirai import FriendMessage, GroupMessage, MessageEvent
+from mirai import FriendMessage, GroupMessage, Image, MessageChain, MessageEvent, Plain, TempMessage
+from mirai.models.entities import Friend
+
+import mirai.models.message
 
 from ..plugin import Plugin, autorun, instr
 import json
@@ -18,7 +25,16 @@ from typing import TypeVar, Generic
 import re
 from collections.abc import Iterable
 
+from mirai.models.message import Forward, ForwardMessageNode
+
+from pyppeteer import launch
+
+import numpy as np
+import pandas as pd
+from scipy.stats import kstest
+
 RESOURCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ff')
+TMP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
 
 T = TypeVar('T')
 
@@ -102,6 +118,12 @@ class Fk:
     def __eq__(self, __o: object) -> bool:
         return self.fk == __o
 
+    def __ne__(self, __o: object) -> bool:
+        return not(self == __o)
+
+    def __hash__(self) -> int:
+        return hash(self.fk)
+
     def query(self):
         table, item_level_fk = self.fk.split('#')
         return self.db[table][item_level_fk]
@@ -155,9 +177,24 @@ class Db():
     item: FFCsv[ItemKey]
     shop_item_gil: FFCsv[ShopItemGilKey]
 
+    recipe_index_result: Dict[str, List[FFCsvRow[RecipeKey]]]
+
     def __init__(self) -> None:
         self.tables = {}
         self.register_table(*[(self.to_upper_case(name),get_args(t)[0]) for name, t in self.__class__.__annotations__.items() if get_origin(t) is FFCsv])
+        self.recipe_index_result = self.create_index(self.recipe, RecipeKey.ItemResult)
+
+    @staticmethod
+    def create_index(table: FFCsv, field: Any):
+        m: Dict[str, List[FFCsvRow]] = {}
+        for rec in table.values():
+            ikey = rec[field]
+            if ikey not in m:
+                m[ikey] = []
+            m[ikey].append(rec)
+        return m
+            
+        ...
 
     def register_table(self, *table_names):
         for table_name, enum_type in table_names:
@@ -242,12 +279,25 @@ class ItemQuality(Enum):
         return 'HQ' if self is self.HQ else ''
 
 class Item():
+    crystals = [f'{x}之{y}' for x in ('火', '水', '土', '雷', '冰', '风') for y in ('碎晶', '水晶', '晶簇')]
     def __init__(self, name: str, quality: ItemQuality) -> None:
         self.name = name
         self.quality = quality
     
+    def is_crystal(self):
+        return self.name in self.crystals
+
     def __str__(self) -> str:
         return f'{self.name}{self.quality}'
+
+    def __eq__(self, __o: 'Item') -> bool:
+        return (self.name, self.quality) == (__o.name, __o.quality)
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.quality))
+
+    def __ne__(self, __o: object) -> bool:
+        return not(self == __o)
 
     @staticmethod
     def parse(name_expr: str):
@@ -273,8 +323,111 @@ class Price():
     def __str__(self) -> str:
         return f'NQ: {self.nq}, HQ: {self.hq}'
 
+
+
+@dataclass
+class TransactionSummary():
+    price: Price
+    recent_transaction_nq: int
+    recent_transaction_hq: int
+    ...
+
+class PriceCacheRec():
+    price: Price
+    lock: asyncio.Event
+    recent_transaction_nq: int
+    recent_transaction_hq: int
+    world: str
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Event()
+
+class PriceCache():
+    items: Dict[str, PriceCacheRec]
+    def __init__(self) -> None:
+        self.items = {}
+
+    async def wait_if_existed(self, name: str):
+        if name not in self.items:
+            self.items[name] = PriceCacheRec()
+            return
+        item = self.items[name]
+        await item.lock.wait()
+        return item
+
+    def set_rec(self, name: str, world: str, price: Price, recent_transaction_nq: int, recent_transaction_hq: int):
+        item = self.items[name]
+        item.world = world
+        item.price = price
+        item.recent_transaction_nq = recent_transaction_nq
+        item.recent_transaction_hq = recent_transaction_hq
+        item.lock.set()
+
+    ...
+
+class RecipeWithCount:
+    recipe: 'Recipe'
+    count: int
+
+    def __init__(self, *, recipe: 'Recipe', count: int) -> None:
+        self.recipe = recipe
+        self.count = count
+
+class MaterialRepo():
+    d: Dict[Item, RecipeWithCount]
+    total_price: int
+    total_income: int
+    def __init__(self) -> None:
+        self.d = {}
+        self.total_price = 0
+        self.total_income = 0
+
+    def append(self, item: Item, recipe: 'Recipe', count: int, total_price: int):
+        if item in self.d:
+            self.d[item].count += count
+        else:
+            self.d[item] = RecipeWithCount(recipe=recipe, count=count)
+        self.total_price += total_price
+
+    def add_income(self, income: int):
+        self.total_income += income
+
+    def __str__(self) -> str:
+        # 按照数量排序，水晶固定放后面
+        normals: List[Tuple[Item, RecipeWithCount]] = []
+        crystals = []
+        for i in self.d.items():
+            if i[0].is_crystal():
+                crystals.append(i)
+            else:
+                normals.append(i)
+        result = ''
+        for op in (normals, crystals):
+            op.sort(key=lambda i: i[1].count, reverse=True)
+            for i, rc in op:
+                from_shop = rc.recipe.single_price == rc.recipe.shop_price
+                world_str = f'({rc.recipe.world})' if rc.recipe.world != '沃仙曦染' and not from_shop else ''
+                result += f'{i} x {rc.count} ~ {rc.recipe.single_price} {"商" if from_shop else ""} {world_str}\n'
+
+        profit_margin = round((self.total_income - self.total_price) / self.total_price * 100)
+        
+        result += f'\n总成本: {self.total_price}G\n'
+        result += f'总收益: {self.total_income}G\n'
+        result += f'总利润率: {profit_margin}%\n'
+
+        return result
+        
 class Recipe():
-    def __init__(self, name: str, result_count: int = 1) -> None:
+    connector: aiohttp.TCPConnector = None
+    recipe_client: aiohttp.ClientSession = None
+
+    @classmethod
+    async def sinit(cls):
+        print('init recipt client')
+        cls.connector = aiohttp.TCPConnector(limit=20)
+        cls.recipe_client = aiohttp.ClientSession(connector=cls.connector)
+
+    def __init__(self, name: str, rule: 'RecipeRule', price_cache: PriceCache, result_count: int = 1, *, level: int) -> None:
         self.jobs: List[RequiredJob] = []
         self.materials: List['Material'] = []
         self.result_count = result_count
@@ -283,6 +436,12 @@ class Recipe():
         self.item = Item.parse(name)
         self.selected = False
         self.shop_price = None
+        self.recent_transaction_nq = 0
+        self.recent_transaction_hq = 0
+        self.price_cache = price_cache
+        self.world = None
+        self.rule = rule
+        self.level = level
 
     def resolve_require_count(self, count: int = 1):
         times = math.ceil(count / self.result_count) # 制作次数
@@ -297,6 +456,8 @@ class Recipe():
 
     def resolve_shop_price(self):
         item_rec = db.item.find_by(ItemKey.Singular, self.item.name)
+        if item_rec is None:
+            raise RuntimeError(f'物品: "{self.item.name}"不存在')
         found_shop_gil = db.shop_item_gil.find_by(ShopItemGilKey.Item, item_rec.key_as_fk)
         if found_shop_gil is not None:
             self.shop_price = found_shop_gil[ShopItemGilKey.Gil]
@@ -306,17 +467,102 @@ class Recipe():
     def __collect_unit_price(self):
         return [self.__update_unit_price(), [m.recipe.__collect_unit_price() for m in self.materials]]
 
+    @staticmethod
+    def norm_detect(data):
+        if len(data) == 0:
+            return data
+        df = pd.DataFrame(data, columns=['value'])
+        u = df['value'].mean()
+        std = df['value'].std()
+        res = kstest(df, 'norm', (u, std))[1]
+        if res<=0.05:
+            error = df[np.abs(df['value'] - u) > 3 * std]
+            data_c = df[np.abs(df['value'] - u) <= 3 * std]
+            error_list = error.value.tolist()
+            if len(error_list) > 0:
+                print(f'异常数据: {error_list}')
+            return data_c.value.tolist()
+        else:
+            return data
+
+    @classmethod
+    def strip_bad_val(self, entries: Any):
+        vals = [entry['pricePerUnit'] for entry in entries]
+        vals_c = self.norm_detect(vals)
+        return [entry for entry in entries if entry['pricePerUnit'] in vals_c]
+        ...
+
+    @staticmethod
+    def classify(entries: Dict[str, Any], by_key: str) -> Dict[str, Dict[str, Any]]:
+        classified = {}
+        for entry in entries:
+            real_key = entry[by_key]
+            if real_key not in classified:
+                rec = []
+                classified[real_key] = rec
+            else:
+                classified[real_key].append(entry)
+        return classified
+
+    @classmethod
+    def calc_spec_quality(self, entries: Dict[str, Any], is_hq: str):
+        ts_now = time.time()
+        ts_half_day_ago = ts_now - 12 * 60 * 60
+        ts_7day_ago = ts_now - 7 * 24 * 60 * 60
+
+        xqs = self.strip_bad_val([entry for entry in entries if entry['hq'] == is_hq])
+        xqs_c = xqs[:max(5, len([xq for xq in xqs if xq['timestamp'] > ts_half_day_ago]))]
+        xq_total_gil = sum([xq['pricePerUnit'] * xq['quantity'] for xq in xqs_c])
+        xq_cnt = sum([xq['quantity'] for xq in xqs_c])
+        xq_avg = round(xq_total_gil / xq_cnt) if xq_cnt > 0 else None
+
+        recent_transaction_xq = sum([xq['quantity'] for xq in xqs if xq['timestamp'] > ts_7day_ago])
+        return xq_avg, recent_transaction_xq
+
+    @classmethod
+    def calc_transaction(self, entries: Dict[str, Any]) -> TransactionSummary:
+        nq_avg, recent_transaction_nq = self.calc_spec_quality(entries, False)
+        hq_avg, recent_transaction_hq = self.calc_spec_quality(entries, True)
+        price = Price(nq_avg, hq_avg)
+        return TransactionSummary(price=price, recent_transaction_nq=recent_transaction_nq, recent_transaction_hq=recent_transaction_hq)
+
+    def get_prefer_trans_summary(self, tw: Dict[str, TransactionSummary]) -> Tuple[str, TransactionSummary]:        
+        items = list(tw.items())
+        items = [item for item in items if item[1].price[self.item.quality] is not None]
+        if self.rule.cross_server_query and self.level != 0:
+            items = sorted(items, key=lambda x: x[1].price[self.item.quality])
+        else:
+            items = [item for item in items if item[0] == '沃仙曦染'] + sorted(
+                [item for item in items if item[0] != '沃仙曦染'], key=lambda x: x[1].price[self.item.quality]
+            )
+        return items[0]
+
     async def __update_unit_price(self) -> Price:
+        cached_result = await self.price_cache.wait_if_existed(self.item.name)
+        if cached_result is not None:
+            print('get price of', self.item.name, 'from cache')
+            self.unit_price = cached_result.price
+            self.world = cached_result.world
+            self.recent_transaction_nq = cached_result.recent_transaction_nq
+            self.recent_transaction_hq = cached_result.recent_transaction_hq
+            return
+
         item_rec = db.item.find_by(ItemKey.Singular, self.item.name)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=400') as response:
-                resp = await response.json()
-        entries = [entry for entry in resp['entries'] if entry['worldName'] == '沃仙曦染']
-        nqs = [entry for entry in entries if not entry['hq']]
-        hqs = [entry for entry in entries if entry['hq']]
-        nq_avg = round(sum([nq['pricePerUnit'] for nq in nqs]) / len(nqs)) if len(nqs) > 0 else None
-        hq_avg = round(sum([hq['pricePerUnit'] for hq in hqs]) / len(hqs)) if len(hqs) > 0 else None
-        self.unit_price = Price(nq_avg, hq_avg)
+        # async with aiohttp.ClientSession() as session:
+        print(f'try get price of {self.item}')
+        async with self.recipe_client.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=100') as response:
+            resp = await response.json()
+
+        entries_of_worlds = self.classify(resp['entries'], 'worldName')
+        transaction_of_worlds = {world: self.calc_transaction(entries) for world, entries in entries_of_worlds.items()}
+        world, trans_summary = self.get_prefer_trans_summary(transaction_of_worlds)
+
+        self.unit_price = trans_summary.price
+        self.world = world
+        self.recent_transaction_nq = trans_summary.recent_transaction_nq
+        self.recent_transaction_hq = trans_summary.recent_transaction_hq
+
+        self.price_cache.set_rec(self.item.name, self.world, self.unit_price, self.recent_transaction_nq, self.recent_transaction_hq)
         print(f'{self.item}', self.unit_price)
 
     def check_min_cost_node(self):
@@ -333,7 +579,7 @@ class Recipe():
             return self.total_price
 
     @property
-    def total_price(self):
+    def single_price(self):
         price = self.unit_price[self.item.quality]
         if self.item.quality is ItemQuality.NQ and self.shop_price is not None:
             if price is None:
@@ -342,7 +588,18 @@ class Recipe():
                 price = min(self.shop_price, price)
         if price is None:
             raise RuntimeError(f'未查询到物品"{self.item}"的价格')
-        return price * self.require_count
+        return price
+        ...
+
+    @property
+    def total_price(self):
+        return self.single_price * self.require_count
+
+    def gather_material(self, repo: MaterialRepo):
+        if self.selected:
+            repo.append(self.item, self, self.require_count, self.total_price)
+        for m in self.materials:
+            m.recipe.gather_material(repo)
 
     async def parse(self, *decos: Callable[[str], Awaitable[Any]]) -> List[str]: # 需要的成品个数
         s = []
@@ -358,7 +615,8 @@ class Recipe():
             obtain_ways.append(f'商店:{self.shop_price}G')
         if len(obtain_ways) == 0:
             obtain_ways.append('未知')
-        formatted_item = f'[{"√" if self.selected else "x"}]{self.item} x {self.require_count} [{" ".join([str(j) for j in obtain_ways])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item.name) for d in decos])])}'
+        world_str = f'({self.world})' if self.world != '沃仙曦染' else ''
+        formatted_item = f'[{"√" if self.selected else "x"}]{self.item} x {self.require_count} [{" ".join([str(j) for j in obtain_ways])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item.name) for d in decos])])} {world_str}'
         if self.unit_price is not None:
             formatted_item += f' -> {self.total_price}G'
         s.append(formatted_item)
@@ -370,11 +628,11 @@ class Recipe():
         return s
 
     @classmethod
-    def build(self, name: str):
-        r = Recipe(name)
+    def build(self, name: str, rule: 'RecipeRule', price_cache: PriceCache, result_count: int = 1, *, level: int = 0):
+        r = Recipe(name, rule, price_cache, result_count, level=level)
         matched = False
-        for recipe in db.recipe.values():
-            if recipe[RecipeKey.ItemResult] == r.item.name:
+        if r.item.name in db.recipe_index_result:
+            for recipe in db.recipe_index_result[r.item.name]:
                 job = recipe[RecipeKey.CraftType]
                 rj = RequiredJob()
                 rj.job = Job[job]
@@ -382,12 +640,12 @@ class Recipe():
                 r.jobs.append(rj)
                 if not matched:
                     matched = True
-                    r.result_count = recipe[RecipeKey.AmountResult]
+                    r.result_count = max(recipe[RecipeKey.AmountResult], r.result_count)
                     for i in range(10): #8
                         item_name = recipe[f'Item{{Ingredient}}[{i}]']
                         item_amount = recipe[f'Amount{{Ingredient}}[{i}]']
                         if item_amount > 0:
-                            r.materials.append(Material(self.build(item_name), item_amount))
+                            r.materials.append(Material(self.build(item_name, rule, price_cache, level=level+1), item_amount * r.result_count))
         return r
 
 class Material():
@@ -414,10 +672,12 @@ class RecipeRule():
     def __init__(self) -> None:
         self.force_use_items: List[Item] = []
         self.cross_server_query = False
+        self.only_summary = False
 
     class State(Enum):
         ForceUse = '使用' # 指定最终配方强制使用某种材料
-        CrossServer = '跨服查价' # 启用后将计算全区平均价格
+        CrossServer = '跨服' # 启用后将计算全区平均价格
+        OnlySummary = '概览'
         Unknown = auto()
         ...
 
@@ -429,7 +689,6 @@ class RecipeRule():
         for l in lex:
             if l in state_strs:
                 state = self.State(l)
-                continue
             if state is self.State.Unknown:
                 raise RuntimeError(f'请指定规则名, 可选: {",".join(state_strs)}')
             if state is self.State.ForceUse:
@@ -439,10 +698,72 @@ class RecipeRule():
                 rule.cross_server_query = True
                 state = self.State.Unknown
                 continue
+            if state is self.State.OnlySummary:
+                rule.only_summary = True
+                state = self.State.Unknown
+                continue
         return rule
+
+@dataclass
+class Say():
+    text: str
+    comefrom: str
+    ...
+
+def rnd_str(len: int = 5):
+    return "".join(random.sample("zyxwvutsrqponmlkjihgfedcba0123456789",len))
+
+def to_vp_params(param_str: str) -> Dict[str, int]:
+    param_str = param_str.replace(' ', '')
+    params = param_str.split(',')
+    params = [p.split('=')[:2] for p in params]
+    params = [p if p[0] not in ('width', 'height') else [p[0], int(p[1])] for p in params]
+    return dict(params)
+
+class MacroEngine():
+    def __init__(self) -> None:
+        self.vars = {
+            '580HQ_服装_T职': '古典风格剑斗士头甲HQ,古典风格剑斗士兜甲HQ,古典风格剑斗士袖甲HQ,古典风格剑斗士三角裤HQ,古典风格剑斗士胫甲HQ',
+            '580HQ_首饰_T职': '古典风格御敌耳坠HQ,古典风格御敌项环HQ,古典风格御敌手环HQ,古典风格御敌指环HQ*2',
+            '580HQ_十件套_T职': '$580HQ_服装_T职,$580HQ_首饰_T职',
+            '580HQ_主副手_战士': '古典风格战斧HQ',
+            '580HQ_主副手_骑士': '古典风格长剑HQ,古典风格长盾HQ',
+            '580HQ_主副手_暗黑骑士': '古典风格巨剑HQ',
+            '580HQ_主副手_绝枪战士': '古典风格枪刃HQ',
+
+            '580HQ_战士': '$580HQ_十件套_T职,$580HQ_主副手_战士',
+            '580HQ_骑士': '$580HQ_十件套_T职,$580HQ_主副手_骑士',
+            '580HQ_暗黑骑士': '$580HQ_十件套_T职,$580HQ_主副手_暗黑骑士',
+            '580HQ_绝枪战士': '$580HQ_十件套_T职,$580HQ_主副手_绝枪战士',
+            '580HQ_T职': '$580HQ_十件套_T职,$580HQ_主副手_战士,$580HQ_主副手_骑士,$580HQ_主副手_暗黑骑士,$580HQ_主副手_绝枪战士',
+        }
+
+    def parse(self, text: str):
+        expr = '\\$([\u4e00-\u9fa5_a-zA-Z0-9]+)'
+        proc = text
+        def rep(m):
+            return self.vars[m.group(1)]
+        while re.match(expr, proc) is not None:
+            proc = re.sub(expr, rep, proc)
+        return proc
+
+class ItemCountExpr():
+    item_name: str
+    count: int
+    def __init__(self, expr: str) -> None:
+        parsed = expr.split('*')
+        self.item_name = parsed[0]
+        if len(parsed) > 1:
+            self.count = int(parsed[1])
+        else:
+            self.count = 1
+        pass
+    
+    ...
 
 class FF(Plugin):
     def __init__(self) -> None:
+        self.macro_engine = MacroEngine()
         super().__init__('ff')
 
     def get_resolvers(self):
@@ -450,23 +771,209 @@ class FF(Plugin):
             RecipeRule: RecipeRule.of
         }
 
-    @instr('配方')
-    async def recipe(self, name: str, expr: RecipeRule):
-        
-        if name == '帮助':
-            return """ff 配方 目标商品 材料是否跨服? 生产个数 HQ素材列表(逗号分隔)"""
+    @autorun
+    async def recipe_init(self):
+        await Recipe.sinit()
 
-        recipe_tree = Recipe.build(name)
+    async def mrmy(self):
+        async with aiohttp.ClientSession() as session:
+            result = Say('咱们尼格有力量!', '佚名')
+            url = f'https://eolink.o.apispace.com/mingrenmingyan/api/v1/ming_ren_ming_yan/random?page_size=1'
+            async with session.get(url, headers={
+                'X-APISpace-Token': 'n1bk048xsp53crpwfjlh4pq8267fvv7d',
+                'Authorization-Type': 'apikey',
+            }) as response:
+                resp = await response.json()
+        if resp['code'] == 200:
+            data = resp['data'][0]
+            result = Say(data['text'], data["comefrom"])
+        return result
+
+    @staticmethod
+    async def query_pic(say: Say, file = None):
+        if file is None:
+            file = os.path.join(TMP_PATH, f'{rnd_str()}.png')
+        browser = await launch()
+        page = await browser.newPage()
+        pic_id = random.randint(0, 8)
+        await page.goto(f'http://127.0.0.1:5000/ad/{pic_id}?text={urllib.parse.quote_plus(say.text)}&comefrom={urllib.parse.quote_plus(say.comefrom)}')
+
+        # viewport = await page.querySelector('meta[name="viewport"]')
+        # viewport_content = await viewport.getProperty('content')
+        # viewport_content = await viewport_content.jsonValue()
+        # vp_params = to_vp_params(viewport_content)
+        # await page.setViewport({
+        #     'width': vp_params['width'],
+        #     'height': vp_params['height'],
+        # })
+        await page.setViewport({
+            'width': 1000,
+            'height': 600,
+        })
+
+        await page.screenshot({
+            'path': file,
+            'omitBackground': True,
+        })
+
+        await browser.close()
+        return file
+
+    @instr('师说')
+    async def adl_say(self):
+        say = await self.mrmy()
+        while len(say.text) > 58:
+            say = await self.mrmy()
+        file = await self.query_pic(say)
+        return [
+            mirai.models.message.Image(path=file)
+        ]
+
+    async def get_recipe_rec(self, item: ItemCountExpr, rule: RecipeRule, price_cache: PriceCache, repo: MaterialRepo):
+        print(f'build recipe tree of {item.item_name}')
+        recipe_tree = Recipe.build(item.item_name, rule, price_cache, item.count)
+        print(f'resolve_require_count of {item.item_name}')
         recipe_tree.resolve_require_count()
+        print(f'resolve_shop_price of {item.item_name}')
         recipe_tree.resolve_shop_price()
+        print(f'resolve tree price of {item.item_name}')
         await recipe_tree.resolve_unit_price()
         recipe_tree.check_min_cost_node()
 
         cost = recipe_tree.min_cost_of()
+        recipe_tree.gather_material(repo)
+        repo.add_income(recipe_tree.total_price)
+        
         price = recipe_tree.total_price
         profit_margin = round((price - cost) / cost * 100)
-        return ['\n'.join(await recipe_tree.parse()) + f'\n\n成本估计: {cost}G\n价格估计: {price}G\n利润率: {profit_margin}%']
+        result = ''
+        result += '\n'.join(await recipe_tree.parse())
+        result += '\n\n'
+        result += f'成本估计: {cost}G\n价格估计: {price}G\n利润率: {profit_margin}%\n'
+        result += f'7日内售出 HQ:{recipe_tree.recent_transaction_hq} NQ:{recipe_tree.recent_transaction_nq}'
+        return result
 
-    @instr('薪资')
-    async def salary():
+    @instr('配方')
+    async def recipe(self, event: MessageEvent, name: str, expr: RecipeRule):
+        # if type(event) is GroupMessage:
+        #     raise RuntimeError('请私聊机器人使用本命令')
+        print(f'配方 {event.sender.get_name()}({"群聊" if type(event) is GroupMessage else "私聊"}) -> {name}')
+        price_cache = PriceCache()
+        repo = MaterialRepo()
+
+        results = await asyncio.gather(*[self.get_recipe_rec(ItemCountExpr(n), expr, price_cache, repo) for n in self.macro_engine.parse(name).split(',')])
+        
+        say = await self.mrmy()
+        while len(say.text) > 58:
+            say = await self.mrmy()
+        file = await self.query_pic(say)
+        return [
+            Forward(node_list=[
+                *([ForwardMessageNode.create(
+                    event.sender, 
+                    MessageChain([str(repo)])
+                )] if len(results) > 1 or expr.only_summary else []),
+                *[
+                    ForwardMessageNode.create(
+                        event.sender, 
+                        MessageChain([result])
+                    ) for result in (results if not expr.only_summary else [])
+                ],
+                ForwardMessageNode.create(
+                    Friend(id=1293103235, nickname='阿德勒'),
+                    MessageChain([
+                        mirai.models.message.Image(path=file)
+                    ])
+                )
+            ])
+        ]
+        # return [result]
+        
+    @instr('价格')
+    async def price(self, event: MessageEvent, name: str, span: int = 1):
+        if type(event) is GroupMessage:
+            raise RuntimeError('请私聊机器人使用本命令')
+
+        # 查询n日内各服的平均价格
+        item_rec = db.item.find_by(ItemKey.Singular, name)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=1000') as response:
+                resp = await response.json()
+        entries = resp['entries']
+        entry_of_worlds = {}
+        ts_now = time.time()
+        ts_nday_ago = ts_now - span * 24 * 60 * 60
+
+        # 分类
+        for entry in entries:
+            world_name = entry['worldName']
+            if world_name not in entry_of_worlds:
+                rec = []
+                entry_of_worlds[world_name] = rec
+            else:
+                rec = entry_of_worlds[world_name]
+            if entry['timestamp'] > ts_nday_ago:
+                # print(entry)
+                rec.append(entry)
+
+        info_of_world = {}
+        for world_name, entries in entry_of_worlds.items():
+            nqs = [entry for entry in entries if not entry['hq']]
+            hqs = [entry for entry in entries if entry['hq']]
+            nq_total_gil = sum([nq['pricePerUnit'] * nq['quantity'] for nq in nqs])
+            hq_total_gil = sum([hq['pricePerUnit'] * hq['quantity'] for hq in hqs])
+            nq_cnt = sum([nq['quantity'] for nq in nqs])
+            hq_cnt = sum([hq['quantity'] for hq in hqs])
+            info_of_world[world_name] = {
+                'nq_avg': round(nq_total_gil / nq_cnt) if nq_cnt > 0 else '无',
+                'nq_cnt': nq_cnt,
+                'hq_avg': round(hq_total_gil / hq_cnt) if hq_cnt > 0 else '无',
+                'hq_cnt': hq_cnt,
+            }
+        
+        res = []
+        res.append(f'==={name}===')
+        for world_name, info in info_of_world.items():
+            res.append(f'{world_name} NQ({info["nq_cnt"]}): {info["nq_avg"]}, HQ({info["hq_cnt"]}): {info["hq_avg"]}')
+        
+        return ['\n'.join(res)]
+
+
+    @instr('合并')
+    async def comb(self, event: MessageEvent):
+        return [
+            Forward(node_list=[
+                ForwardMessageNode.create(
+                    event.sender, 
+                    MessageChain(['hi'])
+                )
+            ])
+        ]
+
+    class MacroSubCmd(Enum):
+        Var = '变量'
+        Exec = '执行'
         ...
+
+    @instr('宏')
+    async def var(self, sub_cmd: MacroSubCmd, term: str=None):
+        if sub_cmd is self.MacroSubCmd.Var:
+            return ', '.join( self.macro_engine.vars.keys())
+        if sub_cmd is self.MacroSubCmd.Exec:
+            return self.macro_engine.parse(term)
+        
+
+    class SalarySubCmd(Enum):
+        Start = '开始'
+        Stop = '结束'
+        ...
+
+    @instr('打工')
+    async def salary(self, sub_cmd: SalarySubCmd, img: Image):
+        path = await img.download(os.path.join(TMP_PATH, f'{rnd_str()}.jpg'))
+        # result = reader.readtext(str(path), allowlist='0123456789,', decoder='wordbeamsearch', contrast_ths=0.8)
+        # print(result)
+        # if sub_cmd is self.SalarySubCmd.Start:
+        #     ...
+        # if sub_cmd is self.SalarySubCmd.Stop:
+        #     ...

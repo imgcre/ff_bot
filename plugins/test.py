@@ -1,6 +1,7 @@
-from mirai import FriendMessage, GroupMessage, MessageEvent
+from mirai import FriendMessage, GroupMessage, MessageChain, MessageEvent
 from ..plugin import Plugin, autorun, instr
-
+from mirai.models.message import Forward, ForwardMessageNode
+from mirai.models.entities import Friend
 class CustomArg():
     def __init__(self, x) -> None:
         self.x = x
@@ -20,8 +21,13 @@ class Test(Plugin):
             CustomArg: resolve
         }
 
-    @instr('默认')
-    async def create(self, event: FriendMessage, dd: CustomArg):
+    @instr('假消息')
+    async def create(self, id: str, name: str, msg: str):
         return [
-            f'值: {dd}'
+            Forward(node_list=[
+                ForwardMessageNode.create(
+                    Friend(id=id, nickname=name), 
+                    MessageChain([msg])
+                )
+            ])
         ]
