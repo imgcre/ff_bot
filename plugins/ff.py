@@ -33,6 +33,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import kstest
 
+import datetime
+
 RESOURCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ff')
 TMP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
 
@@ -178,11 +180,19 @@ class Db():
     shop_item_gil: FFCsv[ShopItemGilKey]
 
     recipe_index_result: Dict[str, List[FFCsvRow[RecipeKey]]]
+    item_index_singular: Dict[str, List[FFCsvRow[ItemKey]]]
+    shop_item_gil_index_item: Dict[str, List[FFCsvRow[ShopItemGilKey]]]
+    gathering_item_index_item: Dict[str, List[FFCsvRow[GatheringItemKey]]]
+    spearfishing_item_index_item: Dict[str, List[FFCsvRow[SpearfishingItemKey]]]
 
     def __init__(self) -> None:
         self.tables = {}
         self.register_table(*[(self.to_upper_case(name),get_args(t)[0]) for name, t in self.__class__.__annotations__.items() if get_origin(t) is FFCsv])
         self.recipe_index_result = self.create_index(self.recipe, RecipeKey.ItemResult)
+        self.item_index_singular = self.create_index(self.item, ItemKey.Singular)
+        self.shop_item_gil_index_item = self.create_index(self.shop_item_gil, ShopItemGilKey.Item)
+        self.gathering_item_index_item = self.create_index(self.gathering_item, GatheringItemKey.Item)
+        self.spearfishing_item_index_item = self.create_index(self.spearfishing_item, SpearfishingItemKey.Item)
 
     @staticmethod
     def create_index(table: FFCsv, field: Any):
@@ -221,8 +231,12 @@ class Db():
             return
         point_method = point[GatheringPointBaseKey.GatheringType]
         result.job.job = GatheringItem.job_from_method(point_method)
-        g_item = self.gathering_item.find_by(GatheringItemKey.Item, name)
-        s_item = self.spearfishing_item.find_by(SpearfishingItemKey.Item, name)
+        g_item = None
+        if name in self.gathering_item_index_item:
+            g_item = self.gathering_item_index_item[name][0]
+        s_item = None
+        if name in self.spearfishing_item_index_item:
+            s_item = self.spearfishing_item_index_item[name][0]
         level_row = None
         if g_item is not None:
             level_row = g_item[GatheringItemKey.GatheringItemLevel].query()
@@ -455,10 +469,14 @@ class Recipe():
         await asyncio.gather(*cos)
 
     def resolve_shop_price(self):
-        item_rec = db.item.find_by(ItemKey.Singular, self.item.name)
+        item_rec = None
+        if self.item.name in db.item_index_singular:
+            item_rec = db.item_index_singular[self.item.name][0]
         if item_rec is None:
             raise RuntimeError(f'物品: "{self.item.name}"不存在')
-        found_shop_gil = db.shop_item_gil.find_by(ShopItemGilKey.Item, item_rec.key_as_fk)
+        found_shop_gil = None
+        if item_rec.key_as_fk in db.shop_item_gil_index_item:
+            found_shop_gil =  db.shop_item_gil_index_item[item_rec.key_as_fk][0]
         if found_shop_gil is not None:
             self.shop_price = found_shop_gil[ShopItemGilKey.Gil]
         for m in self.materials:
@@ -547,7 +565,7 @@ class Recipe():
             self.recent_transaction_hq = cached_result.recent_transaction_hq
             return
 
-        item_rec = db.item.find_by(ItemKey.Singular, self.item.name)
+        item_rec = db.item_index_singular[self.item.name][0]
         # async with aiohttp.ClientSession() as session:
         print(f'try get price of {self.item}')
         async with self.recipe_client.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=100') as response:
@@ -736,6 +754,69 @@ class MacroEngine():
             '580HQ_暗黑骑士': '$580HQ_十件套_T职,$580HQ_主副手_暗黑骑士',
             '580HQ_绝枪战士': '$580HQ_十件套_T职,$580HQ_主副手_绝枪战士',
             '580HQ_T职': '$580HQ_十件套_T职,$580HQ_主副手_战士,$580HQ_主副手_骑士,$580HQ_主副手_暗黑骑士,$580HQ_主副手_绝枪战士',
+
+            '580HQ_服装_H职': '古典风格医护兵月桂冠HQ,古典风格医护兵长衣HQ,古典风格医护兵腕环HQ,古典风格医护兵三角裤HQ,古典风格医护兵战靴HQ',
+            '580HQ_首饰_H职': '古典风格治愈耳坠HQ,古典风格治愈项环HQ,古典风格治愈手环HQ,古典风格治愈指环HQ*2',
+            '580HQ_十件套_H职': '$580HQ_服装_H职,$580HQ_首饰_H职',
+            '580HQ_主副手_白魔': '古典风格牧杖HQ',
+            '580HQ_主副手_占星': '古典风格黄道仪HQ',
+            '580HQ_主副手_学者': '古典风格魔导典HQ',
+            '580HQ_主副手_贤者': '古典风格蛇石针HQ',
+            
+            '580HQ_白魔': '$580HQ_十件套_H职,$580HQ_主副手_白魔',
+            '580HQ_占星': '$580HQ_十件套_H职,$580HQ_主副手_占星',
+            '580HQ_学者': '$580HQ_十件套_H职,$580HQ_主副手_学者',
+            '580HQ_贤者': '$580HQ_十件套_H职,$580HQ_主副手_贤者',
+            '580HQ_H职': '$580HQ_十件套_H职,$580HQ_主副手_白魔,$580HQ_主副手_占星,$580HQ_主副手_学者,$580HQ_主副手_贤者',
+
+            '580HQ_服装_远敏': '古典风格弓斗士头甲HQ,古典风格弓斗士长衣HQ,古典风格弓斗士腕环HQ,古典风格弓斗士三角裤HQ,古典风格弓斗士战靴HQ',
+            '580HQ_首饰_远敏': '古典风格精准耳坠HQ,古典风格精准项环HQ,古典风格精准手环HQ,古典风格精准指环HQ*2',
+            '580HQ_十件套_远敏': '$580HQ_服装_远敏,$580HQ_首饰_远敏',
+            '580HQ_主副手_诗人': '古典风格骑兵弓HQ',
+            '580HQ_主副手_机工': '古典风格手炮HQ',
+            '580HQ_主副手_舞者': '古典风格圆月轮HQ',
+
+            '580HQ_诗人': '$580HQ_十件套_远敏,$580HQ_主副手_诗人',
+            '580HQ_机工': '$580HQ_十件套_远敏,$580HQ_主副手_机工',
+            '580HQ_舞者': '$580HQ_十件套_远敏,$580HQ_主副手_舞者',
+            '580HQ_远敏': '$580HQ_十件套_远敏,$580HQ_主副手_诗人,$580HQ_主副手_机工,$580HQ_主副手_舞者',
+
+            '580HQ_服装_法系': '古典风格旗手角冠HQ,古典风格旗手长衣HQ,古典风格旗手半指护手HQ,古典风格旗手裙裤HQ,古典风格旗手战靴HQ',
+            '580HQ_首饰_法系': '古典风格咏咒耳坠HQ,古典风格咏咒项环HQ,古典风格咏咒手环HQ,古典风格咏咒指环HQ*2',
+            '580HQ_十件套_法系': '$580HQ_服装_法系,$580HQ_首饰_法系',
+            '580HQ_主副手_黑魔': '古典风格长玉杖HQ',
+            '580HQ_主副手_赤魔': '古典风格小剑HQ',
+            '580HQ_主副手_召唤': '古典风格魔导书HQ',
+
+            '580HQ_黑魔': '$580HQ_十件套_法系,$580HQ_主副手_黑魔',
+            '580HQ_赤魔': '$580HQ_十件套_法系,$580HQ_主副手_赤魔',
+            '580HQ_召唤': '$580HQ_十件套_法系,$580HQ_主副手_召唤',
+            '580HQ_法系': '$580HQ_十件套_法系,$580HQ_主副手_黑魔,$580HQ_主副手_赤魔,$580HQ_主副手_召唤',
+
+            # 武僧 武士
+            '580HQ_服装_拳斗士': '古典风格拳斗士面具HQ,古典风格拳斗士兜甲HQ,古典风格拳斗士袖甲HQ,古典风格拳斗士三角裤HQ,古典风格拳斗士战靴HQ',
+            # 龙骑士 钐镰客
+            '580HQ_服装_骑士': '古典风格骑士头甲HQ,古典风格骑士长衣HQ,古典风格骑士袖甲HQ,古典风格骑士三角裤HQ,古典风格骑士战靴HQ',
+            # 忍者
+            '580HQ_服装_忍者': '古典风格双剑斗士面具HQ,古典风格双剑斗士兜甲HQ,古典风格双剑斗士袖甲HQ,古典风格双剑斗士三角裤HQ,古典风格双剑斗士战靴HQ',
+            # 武僧 龙骑士 武士 钐镰客
+            '580HQ_首饰_强攻': '古典风格强攻耳坠HQ,古典风格强攻项环HQ,古典风格强攻手环HQ,古典风格强攻指环HQ*2',
+
+            '580HQ_十件套_拳斗士': '$580HQ_服装_拳斗士,$580HQ_首饰_强攻',
+            '580HQ_十件套_骑士': '$580HQ_服装_骑士,$580HQ_首饰_强攻',
+            '580HQ_十件套_忍者': '$580HQ_服装_忍者,$580HQ_首饰_远敏',
+
+            '580HQ_主副手_武僧': '古典风格旋棍HQ',
+            '580HQ_主副手_武士': '古典风格武士刀HQ',
+            '580HQ_主副手_龙骑': '古典风格长枪HQ',
+            '580HQ_主副手_镰刀': '古典风格战镰HQ',
+            '580HQ_主副手_忍者': '古典风格小刀HQ',
+
+            '580HQ_武僧': '$580HQ_十件套_拳斗士,$580HQ_主副手_武僧',
+            '580HQ_武士': '$580HQ_十件套_拳斗士,$580HQ_主副手_武士',
+            '580HQ_龙骑': '$580HQ_十件套_骑士,$580HQ_主副手_龙骑',
+            '580HQ_镰刀': '$580HQ_十件套_骑士,$580HQ_主副手_镰刀',
+            '580HQ_忍者': '$580HQ_十件套_忍者,$580HQ_主副手_忍者',
         }
 
     def parse(self, text: str):
@@ -861,8 +942,14 @@ class FF(Plugin):
         price_cache = PriceCache()
         repo = MaterialRepo()
 
+        prev = datetime.datetime.now()
+
         results = await asyncio.gather(*[self.get_recipe_rec(ItemCountExpr(n), expr, price_cache, repo) for n in self.macro_engine.parse(name).split(',')])
         
+        span = datetime.datetime.now() - prev
+        
+        print('done.')
+
         say = await self.mrmy()
         while len(say.text) > 58:
             say = await self.mrmy()
@@ -880,6 +967,10 @@ class FF(Plugin):
                     ) for result in (results if not expr.only_summary else [])
                 ],
                 ForwardMessageNode.create(
+                    event.sender, 
+                    MessageChain([f'耗时: {span.total_seconds():.2f}秒'])
+                ),
+                ForwardMessageNode.create(
                     Friend(id=1293103235, nickname='阿德勒'),
                     MessageChain([
                         mirai.models.message.Image(path=file)
@@ -895,7 +986,7 @@ class FF(Plugin):
             raise RuntimeError('请私聊机器人使用本命令')
 
         # 查询n日内各服的平均价格
-        item_rec = db.item.find_by(ItemKey.Singular, name)
+        item_rec = db.item_index_singular[name][0]
         async with aiohttp.ClientSession() as session:
             async with session.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=1000') as response:
                 resp = await response.json()
