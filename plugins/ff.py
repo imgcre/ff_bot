@@ -8,7 +8,8 @@ import random
 import stat
 import sys
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Tuple, Union, get_args, get_origin
+from turtle import end_poly
+from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple, Union, get_args, get_origin
 import urllib.parse
 
 import aiohttp
@@ -387,14 +388,81 @@ class RecipeWithCount:
         self.recipe = recipe
         self.count = count
 
+class RequiredCountRepo():
+    d: Dict[Item, int]
+
+    def __init__(self) -> None:
+        self.d = {}
+
+    def append(self, item: Item, count: int):
+        if item in self.d:
+            self.d[item] += count
+        else:
+            self.d[item] = count
+
+class MissingRecipeNode():
+    def __init__(self, origin: RecipeWithCount) -> None:
+        self.origin = origin
+        self.deps: List[MissingRecipeNode] = []
+        self.job: Job = None
+        self.group = None
+
+    def __str__(self) -> str:
+        m = ", ".join([str(m.recipe.item) for m in self.origin.recipe.materials if not m.recipe.selected])
+        if m == '':
+            m = '<无缺失>'
+        star = ''
+        if self.origin.recipe.level == 0:
+            star = ' ⭐'
+        job = self.origin.recipe.jobs[0].job.name
+        return f'[{job}] {m} -> {self.origin.recipe.item} x {self.origin.count}{star}'
+
+class MissingRecipeGroup():
+    def __init__(self, name: str) -> None:
+        self.nodes: List[MissingRecipeNode] = []
+        self.deps: Set[MissingRecipeGroup] = set()
+        self.name = name
+    
+    def sort_nodes(self):
+        sorted_node = []
+        for n in self.nodes:
+            self.__sort_nodes(n, sorted_node)
+        self.nodes = sorted_node
+
+    def __sort_nodes(self, node: MissingRecipeNode, found: List[MissingRecipeNode]):
+        if node in found or node.group is not self:
+            return
+        for d in node.deps:
+            if d not in found:
+                self.__sort_nodes(d, found)
+        found.append(node)
+
+    def has_loop(self, visited: Set['MissingRecipeGroup'], path: List['MissingRecipeGroup'] = None) -> List['MissingRecipeGroup']:
+        if path is None:
+            path = []
+        if self in path:
+            # 找到最后一个self的位置，以那个为起点（包括他）
+            print('path', [v.name for v in path])
+            print('self', self.name)
+            return path[path.index(self):]
+        visited.add(self)
+        for d in self.deps:
+            print(self.name, '->', d.name)
+            inner_path = d.has_loop(visited, [*path, self])
+            if inner_path is not None:
+                return inner_path
+        return None
+
 class MaterialRepo():
     d: Dict[Item, RecipeWithCount]
     total_price: int
     total_income: int
+    tops: Set['Recipe']
     def __init__(self) -> None:
         self.d = {}
         self.total_price = 0
         self.total_income = 0
+        self.tops = set()
 
     def append(self, item: Item, recipe: 'Recipe', count: int, total_price: int):
         if item in self.d:
@@ -405,6 +473,164 @@ class MaterialRepo():
 
     def add_income(self, income: int):
         self.total_income += income
+
+    def add_missing_top(self, r: 'Recipe'):
+        self.tops.add(r)
+
+    def __resolve_build_step(self, found: List[RecipeWithCount], step: List[RecipeWithCount], r: 'Recipe'):
+        cur = None
+        li = [f for f in found if f.recipe.item == r.item]
+        if len(li) > 0:
+            cur = li[0]
+        if cur is None:
+            print(f'procing {r.item}')
+            rwc = RecipeWithCount(recipe=r, count=r.require_count)
+            found.append(rwc)
+            for ns in [m for m in r.materials if not m.recipe.selected]:
+                self.__resolve_build_step(found, step, ns.recipe)
+            step.append(rwc)
+        else:
+            cur.count += r.require_count
+
+    def __sort_group(self, group: MissingRecipeGroup, found: List[MissingRecipeGroup]):
+        if group in found:
+            return
+        for d in group.deps:
+            if d not in found:
+                self.__sort_group(d, found)
+        found.append(group)
+
+    def get_build_step(self):
+        found: List[RecipeWithCount] = []
+        step: List[RecipeWithCount] = []
+
+        if len(self.tops) > 0:
+            for r in self.tops:
+                self.__resolve_build_step(found, step, r)
+        return step
+
+    def update_group_deps(self, job_grouped_list: List[MissingRecipeGroup]):
+        for group in job_grouped_list:
+            group.deps = set()
+        for group in job_grouped_list:
+            for n in group.nodes:
+                n.group = group
+        for group in job_grouped_list:
+            for n in group.nodes:
+                for dep in n.deps:
+                    if group is not dep.group:
+                        group.deps.add(dep.group)
+        ...
+
+    def optimize_step(self, step: List[RecipeWithCount]):
+        nodes = [MissingRecipeNode(s) for s in step]
+
+        # 处理依赖
+        nodes_index_item: Dict[Item, MissingRecipeNode] = {}
+        for n in nodes:
+            nodes_index_item[n.origin.recipe.item] = n
+        
+        for n in nodes:
+            n.deps = [nodes_index_item[m.recipe.item] for m in n.origin.recipe.materials if not m.recipe.selected]
+
+        # 获取首选职业
+        jobs_conut: Dict[Job, int] = {}
+        for s in step:
+            for j in s.recipe.jobs:
+                if j.job in jobs_conut:
+                    jobs_conut[j.job] += 1
+                else:
+                    jobs_conut[j.job] = 1
+
+        for n in nodes:
+            print(f'before {n.origin.recipe.jobs}')
+            j = sorted([j.job for j in n.origin.recipe.jobs], key=lambda j: jobs_conut[j], reverse=True)[0]
+            print(f'j: {j}')
+            n.job = j
+            n.origin.recipe.jobs = [j for j in n.origin.recipe.jobs if j.job is n.job]
+            print(f'set job {n.origin.recipe.item} -> {n.job} {n.origin.recipe.jobs}')
+
+        # 按照职业分组
+        job_grouped: Dict[Job, MissingRecipeGroup] = {}
+        for n in nodes:
+            if n.job not in job_grouped:
+                print(f'create group for {n.origin.recipe.item} with job {n.job}')
+                job_grouped[n.job] = MissingRecipeGroup(n.job.name)
+            job_grouped[n.job].nodes.append(n)
+            n.group = job_grouped[n.job]
+            print(f'add {n.origin.recipe.item} to group {n.job}')
+
+        print(f'group count {list(job_grouped)}')
+
+        job_grouped_list = list(job_grouped.values())
+
+        # 计算组间依赖
+        self.update_group_deps(job_grouped_list)
+        # for group in job_grouped_list:
+        #     for n in group.nodes:
+        #         for dep in n.deps:
+        #             if group is not dep.group:
+        #                 group.deps.add(dep.group)
+        
+        # 检查是否有环
+
+        # TODO: 把成环的依赖单独拿出来作为一个组
+
+        # 最多进行10次解环处理
+
+        for i in range(10):
+            has_loop = False
+            print('contains', [g.name for g in job_grouped_list])
+
+            visited: Set['MissingRecipeGroup'] = set()
+            while len(visited) < len(job_grouped_list):
+                group = [g for g in job_grouped_list if g not in visited][0]
+                print('====组:', group.name, '====')
+                endpoints = group.has_loop(visited)
+                has_loop = endpoints is not None
+                if has_loop:
+                    print(f'===存在环!===, 第{i + 1}次')
+                    endpoint = endpoints[0]
+                    break
+
+            
+            if not has_loop:
+                break
+
+            print('current', endpoint.name)
+            job_grouped_list.remove(endpoint)
+            # 把endpoint完全拆开
+            # TODO: 识别出造成依赖的所有项，并把他们独立成组合
+            for i, n in enumerate(endpoint.nodes):
+                g = MissingRecipeGroup(f'{endpoint.name}.{i}')
+                g.nodes = [n]
+                job_grouped_list.append(g)
+
+            self.update_group_deps(job_grouped_list)
+        else:
+            return None
+
+        
+
+        # 没有环, 则进行组间排序
+        sorted_group: List[MissingRecipeGroup] = []
+        for group in job_grouped_list:
+            self.__sort_group(group, sorted_group)
+
+        print(f'sorted_group {sorted_group}')
+        
+        for g in sorted_group:
+            g.sort_nodes()
+
+        # sorted_group = list(job_grouped.values())
+
+        result: List[RecipeWithCount] = []
+        for g in sorted_group:
+            print(f'in group {g.nodes[0].job}')
+            for n in g.nodes:
+                result.append(n.origin)
+                print(f'append result: {n}')
+        return result
 
     def __str__(self) -> str:
         # 按照数量排序，水晶固定放后面
@@ -420,14 +646,41 @@ class MaterialRepo():
             op.sort(key=lambda i: i[1].count, reverse=True)
             for i, rc in op:
                 from_shop = rc.recipe.single_price == rc.recipe.shop_price
-                world_str = f'({rc.recipe.world})' if rc.recipe.world != '沃仙曦染' and not from_shop else ''
-                result += f'{i} x {rc.count} ~ {rc.recipe.single_price} {"商" if from_shop else ""} {world_str}\n'
+                world_str = f' ({rc.recipe.world})' if rc.recipe.world != '沃仙曦染' and not from_shop else ''
+                half = f'{"成品" if len(rc.recipe.materials) > 0 else ""}'
+                if len(half) > 0 and rc.recipe.level != 0:
+                    half = '半' + half
+                if len(half) > 0:
+                    half = f' [{half}]'
+                result += f'{i} x {rc.count} ~ {round(rc.recipe.single_price)} {"商" if from_shop else ""}{world_str}{half}\n'
 
         profit_margin = round((self.total_income - self.total_price) / self.total_price * 100)
         
         result += f'\n总成本: {self.total_price}G\n'
         result += f'总收益: {self.total_income}G\n'
         result += f'总利润率: {profit_margin}%\n'
+
+        result += f'\n'
+        step = self.get_build_step()
+
+        optimized_step = None
+        optimized_step = self.optimize_step(step)
+
+        if optimized_step is not None:
+            result += f'(已优化)\n'
+            step = optimized_step
+            ...
+
+        for s in step:
+            m = ", ".join([str(m.recipe.item) for m in s.recipe.materials if not m.recipe.selected])
+            if m == '':
+                m = '<无缺失>'
+            star = ''
+            if s.recipe.level == 0:
+                star = ' ⭐'
+            job = s.recipe.jobs[0].job.name
+            result += f'[{job}] {m} -> {s.recipe.item} x {s.count}{star}\n'
+            ...
 
         return result
         
@@ -439,9 +692,14 @@ class Recipe():
     async def sinit(cls):
         print('init recipt client')
         cls.connector = aiohttp.TCPConnector(limit=20)
-        cls.recipe_client = aiohttp.ClientSession(connector=cls.connector)
+        cls.recipe_client = aiohttp.ClientSession(connector=cls.connector, cookies={
+            'mogboard_server': f'%E6%B2%83%E4%BB%99%E6%9B%A6%E6%9F%93',
+            'mogboard_language': 'chs',
+            'mogboard_timezone': f'Asia%2FShanghai',
+            'mogboard_homeworld': 'yes'
+        })
 
-    def __init__(self, name: str, rule: 'RecipeRule', price_cache: PriceCache, result_count: int = 1, *, level: int) -> None:
+    def __init__(self, name: str, rule: 'RecipeRule', price_cache: PriceCache, rcRepo: RequiredCountRepo, result_count: int = 1, *, level: int) -> None:
         self.jobs: List[RequiredJob] = []
         self.materials: List['Material'] = []
         self.result_count = result_count
@@ -456,10 +714,12 @@ class Recipe():
         self.world = None
         self.rule = rule
         self.level = level
+        self.rcRepo = rcRepo
 
     def resolve_require_count(self, count: int = 1):
         times = math.ceil(count / self.result_count) # 制作次数
         self.require_count = times * self.result_count
+        self.rcRepo.append(self.item, self.require_count)
         for m in self.materials:
             m.recipe.resolve_require_count(times * m.count)
 
@@ -508,7 +768,12 @@ class Recipe():
         vals = [entry['pricePerUnit'] for entry in entries]
         vals_c = self.norm_detect(vals)
         return [entry for entry in entries if entry['pricePerUnit'] in vals_c]
-        ...
+    
+    @classmethod
+    def strip_bad_val_by(self, entries: Any, field_name: str):
+        vals = [entry[field_name] for entry in entries]
+        vals_c = self.norm_detect(vals)
+        return [entry for entry in entries if entry[field_name] in vals_c]
 
     @staticmethod
     def classify(entries: Dict[str, Any], by_key: str) -> Dict[str, Dict[str, Any]]:
@@ -538,11 +803,45 @@ class Recipe():
         return xq_avg, recent_transaction_xq
 
     @classmethod
+    def calc_entries_recent_transaction_xq(self, entries: Dict[str, Any], is_hq: str):
+        ts_now = time.time()
+        ts_7day_ago = ts_now - 7 * 24 * 60 * 60
+        xqs = self.strip_bad_val([entry for entry in entries if entry['hq'] == is_hq])
+        recent_transaction_xq = sum([xq['quantity'] for xq in xqs if xq['timestamp'] > ts_7day_ago])
+        return recent_transaction_xq
+
+    @classmethod
     def calc_transaction(self, entries: Dict[str, Any]) -> TransactionSummary:
         nq_avg, recent_transaction_nq = self.calc_spec_quality(entries, False)
         hq_avg, recent_transaction_hq = self.calc_spec_quality(entries, True)
         price = Price(nq_avg, hq_avg)
         return TransactionSummary(price=price, recent_transaction_nq=recent_transaction_nq, recent_transaction_hq=recent_transaction_hq)
+
+    @classmethod
+    def calc_price_xq(self, listings: Dict[str, Any], count: int, is_hq: bool) -> float:
+        xqs = self.strip_bad_val_by([listing for listing in listings if listing['hq'] == is_hq], 'pricePerUnit')
+        xqs.sort(key=lambda i: i['pricePerUnit'])
+        acc_count = 0
+        total_price = 0
+        for xq in xqs:
+            overflow = False
+            quantity = xq['quantity']
+            if acc_count + quantity >= count:
+                quantity = count - acc_count
+                overflow = True
+            acc_count += quantity
+            total_price += xq['pricePerUnit'] * quantity
+            if overflow:
+                break
+        if acc_count == 0: return
+        return total_price / acc_count
+
+    @classmethod
+    def calc_price(self, listings: Dict[str, Any], count: int) -> float:
+        nq = self.calc_price_xq(listings, count, False)
+        hq = self.calc_price_xq(listings, count, True)
+        return Price(nq, hq)
+        ...
 
     def get_prefer_trans_summary(self, tw: Dict[str, TransactionSummary]) -> Tuple[str, TransactionSummary]:        
         items = list(tw.items())
@@ -555,10 +854,21 @@ class Recipe():
             )
         return items[0]
 
+    def get_prefer_price_realtime(self, price_of_worlds: Dict[str, Price]):
+        items = list(price_of_worlds.items())
+        items = [item for item in items if item[1][self.item.quality] is not None]
+        if self.rule.cross_server_query and self.level != 0:
+            items = sorted(items, key=lambda x: x[1][self.item.quality])
+        else:
+            items = [item for item in items if item[0] == '沃仙曦染'] + sorted(
+                [item for item in items if item[0] != '沃仙曦染'], key=lambda x: x[1][self.item.quality]
+            )
+        return items[0]
+
     async def __update_unit_price(self) -> Price:
         cached_result = await self.price_cache.wait_if_existed(self.item.name)
         if cached_result is not None:
-            print('get price of', self.item.name, 'from cache')
+            # print('get price of', self.item.name, 'from cache')
             self.unit_price = cached_result.price
             self.world = cached_result.world
             self.recent_transaction_nq = cached_result.recent_transaction_nq
@@ -567,19 +877,40 @@ class Recipe():
 
         item_rec = db.item_index_singular[self.item.name][0]
         # async with aiohttp.ClientSession() as session:
-        print(f'try get price of {self.item}')
-        async with self.recipe_client.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=100') as response:
-            resp = await response.json()
+        # print(f'try get price of {self.item}')
+        listings = None
+        for i in range(5):
+            async with self.recipe_client.get(f'https://universalis.app/_next/data/YRQl5w0kO1Rp37hNbxHri/market/{item_rec.key}.json?itemId={item_rec.key}') as response:
+                market_resp = await response.json()
+                try:
+                    listings = market_resp['pageProps']['markets']['陆行鸟']['listings']
+                    break
+                except:
+                    print('market_resp', self.item.name, item_rec.key, market_resp['pageProps']['markets'].keys())
+        if listings is None:
+            raise RuntimeError(f'获取"{self.item.name}"价格超过最大重试次数')
 
-        entries_of_worlds = self.classify(resp['entries'], 'worldName')
-        transaction_of_worlds = {world: self.calc_transaction(entries) for world, entries in entries_of_worlds.items()}
-        world, trans_summary = self.get_prefer_trans_summary(transaction_of_worlds)
+        
+        listings_of_worlds = self.classify(listings, 'worldName')
 
-        self.unit_price = trans_summary.price
+        price_of_worlds = {world: self.calc_price(listings, self.rcRepo.d[self.item]) for world, listings in listings_of_worlds.items()}
+        # world, trans_summary = self.get_prefer_trans_summary(transaction_of_worlds)
+
+        world, price = self.get_prefer_price_realtime(price_of_worlds)
+
+        self.unit_price = price
         self.world = world
-        self.recent_transaction_nq = trans_summary.recent_transaction_nq
-        self.recent_transaction_hq = trans_summary.recent_transaction_hq
 
+        if self.level == 0:
+            async with self.recipe_client.get(f'https://universalis.app/api/history/%E9%99%86%E8%A1%8C%E9%B8%9F/{item_rec.key}?entries=100') as response:
+                resp = await response.json()
+
+            try:
+                entries_of_woxian = self.classify(resp['entries'], 'worldName')['沃仙曦染']
+                self.recent_transaction_nq = self.calc_entries_recent_transaction_xq(entries_of_woxian, False)
+                self.recent_transaction_hq = self.calc_entries_recent_transaction_xq(entries_of_woxian, True)
+            except:
+                ...
         self.price_cache.set_rec(self.item.name, self.world, self.unit_price, self.recent_transaction_nq, self.recent_transaction_hq)
         print(f'{self.item}', self.unit_price)
 
@@ -616,6 +947,8 @@ class Recipe():
     def gather_material(self, repo: MaterialRepo):
         if self.selected:
             repo.append(self.item, self, self.require_count, self.total_price)
+        if not self.selected and self.level == 0:
+            repo.add_missing_top(self)
         for m in self.materials:
             m.recipe.gather_material(repo)
 
@@ -636,7 +969,7 @@ class Recipe():
         world_str = f'({self.world})' if self.world != '沃仙曦染' else ''
         formatted_item = f'[{"√" if self.selected else "x"}]{self.item} x {self.require_count} [{" ".join([str(j) for j in obtain_ways])}]{" ".join([""] + [str(r) for r in await asyncio.gather(*[d(self.item.name) for d in decos])])} {world_str}'
         if self.unit_price is not None:
-            formatted_item += f' -> {self.total_price}G'
+            formatted_item += f' -> {round(self.total_price)}G'
         s.append(formatted_item)
 
         sub = []
@@ -646,8 +979,8 @@ class Recipe():
         return s
 
     @classmethod
-    def build(self, name: str, rule: 'RecipeRule', price_cache: PriceCache, result_count: int = 1, *, level: int = 0):
-        r = Recipe(name, rule, price_cache, result_count, level=level)
+    def build(self, name: str, rule: 'RecipeRule', price_cache: PriceCache, rcRepo: RequiredCountRepo, result_count: int = 1, *, level: int = 0):
+        r = Recipe(name, rule, price_cache, rcRepo, result_count, level=level)
         matched = False
         if r.item.name in db.recipe_index_result:
             for recipe in db.recipe_index_result[r.item.name]:
@@ -663,7 +996,7 @@ class Recipe():
                         item_name = recipe[f'Item{{Ingredient}}[{i}]']
                         item_amount = recipe[f'Amount{{Ingredient}}[{i}]']
                         if item_amount > 0:
-                            r.materials.append(Material(self.build(item_name, rule, price_cache, level=level+1), item_amount * r.result_count))
+                            r.materials.append(Material(self.build(item_name, rule, price_cache, rcRepo, level=level+1), item_amount * r.result_count))
         return r
 
 class Material():
@@ -910,14 +1243,13 @@ class FF(Plugin):
             mirai.models.message.Image(path=file)
         ]
 
-    async def get_recipe_rec(self, item: ItemCountExpr, rule: RecipeRule, price_cache: PriceCache, repo: MaterialRepo):
-        print(f'build recipe tree of {item.item_name}')
-        recipe_tree = Recipe.build(item.item_name, rule, price_cache, item.count)
-        print(f'resolve_require_count of {item.item_name}')
+    def recipe_tree_preprocess(self, item: ItemCountExpr, rule: RecipeRule, price_cache: PriceCache, rcRepo: RequiredCountRepo):
+        recipe_tree = Recipe.build(item.item_name, rule, price_cache, rcRepo, item.count)
         recipe_tree.resolve_require_count()
-        print(f'resolve_shop_price of {item.item_name}')
+        return recipe_tree
+
+    async def get_recipe_rec(self, recipe_tree: Recipe, repo: MaterialRepo):
         recipe_tree.resolve_shop_price()
-        print(f'resolve tree price of {item.item_name}')
         await recipe_tree.resolve_unit_price()
         recipe_tree.check_min_cost_node()
 
@@ -935,16 +1267,16 @@ class FF(Plugin):
         return result
 
     @instr('配方')
-    async def recipe(self, event: MessageEvent, name: str, expr: RecipeRule):
-        # if type(event) is GroupMessage:
-        #     raise RuntimeError('请私聊机器人使用本命令')
+    async def recipe(self, event: MessageEvent, name: str, expr: RecipeRule):        
         print(f'配方 {event.sender.get_name()}({"群聊" if type(event) is GroupMessage else "私聊"}) -> {name}')
         price_cache = PriceCache()
         repo = MaterialRepo()
+        rcRepo = RequiredCountRepo()
 
         prev = datetime.datetime.now()
 
-        results = await asyncio.gather(*[self.get_recipe_rec(ItemCountExpr(n), expr, price_cache, repo) for n in self.macro_engine.parse(name).split(',')])
+        trees = [self.recipe_tree_preprocess(ItemCountExpr(n), expr, price_cache, rcRepo) for n in self.macro_engine.parse(name).split(',')]
+        results = await asyncio.gather(*[self.get_recipe_rec(t, repo) for t in trees])
         
         span = datetime.datetime.now() - prev
         
@@ -956,10 +1288,10 @@ class FF(Plugin):
         file = await self.query_pic(say)
         return [
             Forward(node_list=[
-                *([ForwardMessageNode.create(
+                ForwardMessageNode.create(
                     event.sender, 
                     MessageChain([str(repo)])
-                )] if len(results) > 1 or expr.only_summary else []),
+                ),
                 *[
                     ForwardMessageNode.create(
                         event.sender, 
