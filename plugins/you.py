@@ -1,3 +1,4 @@
+import asyncio
 import os
 from mirai import FriendMessage, GroupMessage, MessageChain, MessageEvent
 from ..plugin import Plugin, autorun, instr

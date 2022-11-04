@@ -16,6 +16,8 @@ activator = AtActivator(bot.qq)
 
 engine = plugin.Engine()
 
+
+
 @bot.on(GroupRecallEvent)
 async def on_recall(event: GroupRecallEvent):
     if event.group.id != 563158420:

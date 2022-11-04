@@ -405,7 +405,7 @@ class MissingRecipeNode():
         self.origin = origin
         self.deps: List[MissingRecipeNode] = []
         self.job: Job = None
-        self.group = None
+        self.group: 'MissingRecipeGroup' = None
 
     def __str__(self) -> str:
         m = ", ".join([str(m.recipe.item) for m in self.origin.recipe.materials if not m.recipe.selected])
@@ -586,13 +586,16 @@ class MaterialRepo():
             while len(visited) < len(job_grouped_list):
                 group = [g for g in job_grouped_list if g not in visited][0]
                 print('====组:', group.name, '====')
-                endpoints = group.has_loop(visited)
-                has_loop = endpoints is not None
+                path = group.has_loop(visited)
+                has_loop = path is not None
                 if has_loop:
                     print(f'===存在环!===, 第{i + 1}次')
-                    endpoint = endpoints[0]
+                    endpoint = path[0]
+                    refpoint = path[1]
                     break
 
+                # 0 -> 1, 1里的东西搓好了才能搓0的, 所以要把0裂开
+                # 查看0的物品的依赖里哪些是属于1组的，把他们单独成一个组
             
             if not has_loop:
                 break
@@ -601,10 +604,19 @@ class MaterialRepo():
             job_grouped_list.remove(endpoint)
             # 把endpoint完全拆开
             # TODO: 识别出造成依赖的所有项，并把他们独立成组合
-            for i, n in enumerate(endpoint.nodes):
-                g = MissingRecipeGroup(f'{endpoint.name}.{i}')
-                g.nodes = [n]
-                job_grouped_list.append(g)
+
+            g0 = MissingRecipeGroup(f'{endpoint.name}.{0}') # 原始组
+            g1 = MissingRecipeGroup(f'{endpoint.name}.{1}') # 拆分组
+            job_grouped_list.extend([g0, g1])
+
+            for n in endpoint.nodes:
+                target = g1 if any([dep.group is refpoint for dep in n.deps]) else g0
+                target.nodes.append(n)
+
+            # for i, n in enumerate(endpoint.nodes):
+            #     g = MissingRecipeGroup(f'{endpoint.name}.{i}')
+            #     g.nodes = [n]
+            #     job_grouped_list.append(g)
 
             self.update_group_deps(job_grouped_list)
         else:
@@ -656,8 +668,8 @@ class MaterialRepo():
 
         profit_margin = round((self.total_income - self.total_price) / self.total_price * 100)
         
-        result += f'\n总成本: {self.total_price}G\n'
-        result += f'总收益: {self.total_income}G\n'
+        result += f'\n总成本: {round(self.total_price)}G\n'
+        result += f'总收益: {round(self.total_income)}G\n'
         result += f'总利润率: {profit_margin}%\n'
 
         result += f'\n'
@@ -880,7 +892,7 @@ class Recipe():
         # print(f'try get price of {self.item}')
         listings = None
         for i in range(5):
-            async with self.recipe_client.get(f'https://universalis.app/_next/data/YRQl5w0kO1Rp37hNbxHri/market/{item_rec.key}.json?itemId={item_rec.key}') as response:
+            async with self.recipe_client.get(f'https://universalis.app/_next/data/drNvtxKLyuZzVoJzGa9hV/market/{item_rec.key}.json?itemId={item_rec.key}') as response:
                 market_resp = await response.json()
                 try:
                     listings = market_resp['pageProps']['markets']['陆行鸟']['listings']
